@@ -4,10 +4,7 @@ import backtype.storm.scheduler.*;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * Created by sajith on 5/13/14.
@@ -28,10 +25,12 @@ public class AttachComponentsScheduler implements IScheduler {
         public Map<String, Integer> getAllocations(){
             return this.allocatedComponents;
         }
+
+        public SupervisorDetails getSupervisorDetails(){return  this.supervisor;}
     }
 
     private static final String COMPONENT_DELIMITER = ",";
-    private static final String VALUE_DELIMITER = ":";
+    private static final String VALUE_DELIMITER = "=";
     public static final String SIDDHI_TOPOLOGY_NAME = "LatencyMeasureTopology";
     private static Log log = LogFactory.getLog(AttachComponentsScheduler.class);
     Map<Integer, SupervisorAllocations> supervisorAllocationsMap = new HashMap<Integer, SupervisorAllocations>();
@@ -41,15 +40,15 @@ public class AttachComponentsScheduler implements IScheduler {
         this.conf = conf;
     }
 
-    // Decoding elements in CompID1:1,CompID2:*,CompID3:2 format
+    // Decoding elements in CompID1=1,CompID2=*,CompID3=2 format
     private void indexAllocations(Collection<SupervisorDetails> supervisorDetails){
         for (SupervisorDetails supervisor : supervisorDetails) {
             Map meta = (Map) supervisor.getSchedulerMeta();
-            String allocationConfig = (String) meta.get("dedicated.to.component");
+            String allocationConfig = (String) meta.get("component.allocation");
 
             if (allocationConfig != null && !allocationConfig.isEmpty()){
-                int allocationOrdering = (meta.get("allocation.ordering") == null) ? Integer.MAX_VALUE :
-                        Integer.parseInt((String) meta.get("allocation.ordering"));
+                int allocationOrdering = (meta.get("allocation.priority") == null) ? Integer.MAX_VALUE :
+                        Integer.parseInt((String) meta.get("allocation.priority"));
 
                 String[] allocations = allocationConfig.split(COMPONENT_DELIMITER);
                 SupervisorAllocations supervisorAllocations = new SupervisorAllocations(supervisor);
@@ -59,6 +58,7 @@ public class AttachComponentsScheduler implements IScheduler {
                     String[] values = allocation.split(VALUE_DELIMITER);
                     supervisorAllocations.addAllocation(values[0].trim(), Integer.parseInt(values[1].trim()));
                     supervisorAllocationsMap.put(allocationOrdering, supervisorAllocations);
+                    log.info(Integer.parseInt(values[1].trim()) + " instances of '" + values[0].trim() + "' configured to be assigned for " + supervisor.getHost());
                     // Putting into a hash map to enforce allocation ordering by it's automatic sorting
                 }
             }
@@ -69,6 +69,37 @@ public class AttachComponentsScheduler implements IScheduler {
         for (Integer port : cluster.getUsedPorts(supervisor)) {
             cluster.freeSlot(new WorkerSlot(supervisor.getId(), port));
         }
+    }
+
+    /**
+     *
+     * @param supervisorAllocations - Allocation details of the supervisor which contains the component names and instance count to be run on the supervisor
+     * @param components - All the components that are available to be scheduled in the topology
+     * @return Retrieve all executors that should be allocated to a supervisor by looking at allocation details
+     */
+    private List<ExecutorDetails> collectAllExecutorsForSuperVisor(SupervisorAllocations supervisorAllocations, Map<String, List<ExecutorDetails>> components){
+        List<ExecutorDetails> executorsForSupervisor = new ArrayList<ExecutorDetails>();
+
+        for (Map.Entry<String, Integer> allocationEntry : supervisorAllocations.getAllocations().entrySet()){
+            String componentName = allocationEntry.getKey();
+            int instanceCount = allocationEntry.getValue();
+            List<ExecutorDetails> allExecutors = components.get(componentName);
+
+            if (allExecutors == null){
+                log.warn("Failed to find executors for component " + componentName);
+                return executorsForSupervisor;
+            }
+            int allocatedInstanceCount = 0;
+
+            for (;(allocatedInstanceCount < instanceCount)  && (!allExecutors.isEmpty()); allocatedInstanceCount++){
+                    ExecutorDetails executor = allExecutors.get(0);
+                    allExecutors.remove(0);
+                    executorsForSupervisor.add(executor);
+            }
+            log.info(allocatedInstanceCount + " out of " + instanceCount + " instances of '" + componentName + "' allocated to be scheduled at " + supervisorAllocations.getSupervisorDetails().getHost());
+        }
+
+        return executorsForSupervisor;
     }
 
     public void schedule(Topologies topologies, Cluster cluster) {
@@ -85,54 +116,55 @@ public class AttachComponentsScheduler implements IScheduler {
                 indexAllocations(cluster.getSupervisors().values());
                 Map<String, List<ExecutorDetails>> componentToExecutors = cluster.getNeedsSchedulingComponentToExecutors(siddhiTopology);
 
+                if (componentToExecutors.isEmpty()){
+                    return;
+                }
+
                 for (Map.Entry<Integer, SupervisorAllocations> entry : supervisorAllocationsMap.entrySet()){
                     SupervisorAllocations supervisorAllocations = entry.getValue();
+                    List<WorkerSlot> availableSlots = cluster.getAvailableSlots(supervisorAllocations.getSupervisorDetails());
 
-                    //TODO : Create lists for each slot of the supervisor
-                    for (Map.Entry<String, Integer> allocationEntry : supervisorAllocations.getAllocations().entrySet()){
-                        // TODO : Collect executors of all componenets for the supervisor into an array
+                    if (availableSlots.isEmpty()){
+                        freeAllSlots(supervisorAllocations.getSupervisorDetails(), cluster);
+                        //throw new RuntimeException("No free slots available for scheduling in supervisor @ " + supervisorAllocations.getSupervisorDetails().getHost());
                     }
-                }
-                /*
-                for(Map.Entry<String, List<ExecutorDetails>> entry : componentToExecutors.entrySet()){
-                    String componentName = entry.getKey();
-                    List<ExecutorDetails> executors = entry.getValue();
-                    SupervisorDetails supervisor = componentToSupervisor.get(componentName);
 
-                    if (supervisor != null){
-                        log.info("Scheduling " + componentName + " on " + supervisor.getHost());
-                        List<WorkerSlot> availableSlots = cluster.getAvailableSlots(supervisor);
+                    List<ExecutorDetails> executorsForSupervisor = collectAllExecutorsForSuperVisor(supervisorAllocations, componentToExecutors);
+                    int totalExecutorCountForSupervisor = executorsForSupervisor.size();
+                    int availableSlotCount = availableSlots.size();
 
-                        if (availableSlots.isEmpty()){
-                            throw new RuntimeException("No free slots available for scheduling in dedicated supervisor @ " + supervisor.getHost());
+                    int executorsPerSlot = (availableSlotCount > totalExecutorCountForSupervisor) ? 1 :
+                            Math.round(totalExecutorCountForSupervisor/(float)availableSlotCount);
+
+                    log.info("Scheduling " + totalExecutorCountForSupervisor + " executors across " + availableSlotCount + " slots of " +supervisorAllocations.getSupervisorDetails().getHost());
+
+                    for (int i = 0; i < availableSlotCount; i++){
+                        List<ExecutorDetails> executorsForSlot = new ArrayList<ExecutorDetails>();
+
+                        for  (int j = 0; (j < executorsPerSlot) && (!executorsForSupervisor.isEmpty()); j++){
+                            ExecutorDetails executorDetails = executorsForSupervisor.get(0);
+                            executorsForSupervisor.remove(0);
+                            executorsForSlot.add(executorDetails);
                         }
 
-                        int availableSlotCount = availableSlots.size();
-                        int executorCount = executors.size();
-
-                        List<List<ExecutorDetails>> executorsForSlots = new ArrayList<List<ExecutorDetails>>();
-                        for (int i = 0; i < availableSlotCount; i++){
-                            executorsForSlots.add(new ArrayList<ExecutorDetails>());
-                        }
-
-                        for (int i = 0; i < executorCount; i++){
-                            int slotToAllocate = i % availableSlotCount;
-                            ExecutorDetails executor = executors.get(i);
-                            executorsForSlots.get(slotToAllocate).add(executor);
-                        }
-
-                        for (int i = 0; i < availableSlotCount; i++){
-                            if (!executorsForSlots.get(i).isEmpty()){
-                                cluster.assign(availableSlots.get(i), siddhiTopology.getId(), executorsForSlots.get(i));
+                        if (!executorsForSlot.isEmpty()){
+                            //log.info("Scheduling " + executorsForSlot.size() + " executors for slot " + availableSlots.get(i).getPort() + " @ " + supervisorAllocations.getSupervisorDetails().getHost());
+                            log.info("Port :" + availableSlots.get(i).getPort());
+                            for (ExecutorDetails detials : executorsForSlot){
+                                log.info("- " + detials.toString() + detials.getStartTask());
                             }
+                            cluster.assign(availableSlots.get(i), siddhiTopology.getId(), executorsForSlot);
                         }
-                    }else{
-                        log.info("No dedicated supervisor for " + componentName);
                     }
+
+                    /*
+                    if (!executorsForSupervisor.isEmpty()){
+                        log.info("Sajith ++++++++++++++++++++++++++++++++++++++");
+                        cluster.assign(availableSlots.get(0), siddhiTopology.getId(), executorsForSupervisor);
+                    }*/
                 }
-                */
             }
         }
-        new EvenScheduler().schedule(topologies, cluster);
+        //new EvenScheduler().schedule(topologies, cluster);
     }
 }
