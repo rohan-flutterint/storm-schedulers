@@ -1,4 +1,4 @@
 storm-schedulers
 ================
 
-Custom schedulear written for apache storm
+Custom schedulers written for Apache Storm
