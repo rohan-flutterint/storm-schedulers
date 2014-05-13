@@ -1,4 +1,4 @@
-package storm.scheduler;
+package org.wso2.siddhi.storm.scheduler;
 
 import backtype.storm.scheduler.*;
 import org.apache.commons.logging.Log;
